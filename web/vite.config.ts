@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 
 // VITE_BASE is set by the Pages workflow, because the site is served from
-// /Three-Way-Financial-Reconciliation-Engine/ there and from / on Render.
+// LedgerLens AI there and from / on Render.
 export default defineConfig({
   base: process.env.VITE_BASE ?? "/",
   plugins: [react()],
