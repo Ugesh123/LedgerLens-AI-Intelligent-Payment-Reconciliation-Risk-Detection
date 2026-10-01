@@ -73,10 +73,9 @@ jobs:
         run: |
           cp web/dist/index.html web/dist/404.html
 
-      - name: Upload LedgerLens Pages artifact
+      - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          name: ledgerlens-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: web/dist
 
   deploy:
@@ -91,5 +90,3 @@ jobs:
       - name: Deploy LedgerLens AI to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-        with:
-          artifact_name: ledgerlens-pages-${{ github.run_id }}-${{ github.run_attempt }}
