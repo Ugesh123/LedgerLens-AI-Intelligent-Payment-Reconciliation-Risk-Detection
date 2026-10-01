@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+data_alt/
+*.log
+report.html
+# The recorded report of the reference run, shipped with the dashboard.
+!web/public/report.html
+qa_answers.json
+
+agent_traces.json
+.eval/
+
+data_amb/
+
+*.patch
+
+# Web dashboard
+web/node_modules/
+web/dist/
+web/dist-ssr/
+*.tsbuildinfo

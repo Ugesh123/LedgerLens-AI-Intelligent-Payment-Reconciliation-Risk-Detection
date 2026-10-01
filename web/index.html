@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Three-way payment reconciliation engine</title>
+    <meta name="description" content="Reconciles a merchant ledger, a payment gateway report and a bank statement. Deterministic matching in tiers, a bounded agent for what is left, and every figure measured against an answer key." />
+    <meta property="og:title" content="Three-way payment reconciliation engine" />
+    <meta property="og:description" content="Ledger, gateway and bank never agree. This works out why, and says honestly what it could not resolve." />
+    <meta property="og:type" content="website" />
+    <meta name="theme-color" content="#F2EAD8" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17110D" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%232B1D14'/%3E%3Crect x='2.5' y='2.5' width='27' height='27' fill='none' stroke='%23F2EAD8' stroke-opacity='.4'/%3E%3Cpath d='M8 17l5 5 11-12' stroke='%23F2EAD8' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+    <script>
+      // Lets CSS hide below-the-fold content for its scroll reveal. Without
+      // JavaScript this never runs and every section stays visible.
+      document.documentElement.classList.add("js");
+
+      // Wake the engine before the bundle has even been fetched. A free-tier
+      // instance sleeps after 15 minutes idle, and this request is what
+      // starts it; the app awaits this promise instead of asking again. It
+      // sits in <head> so the connection to the engine opens in parallel
+      // with the page's own assets rather than after them.
+      (function () {
+        var base = "%VITE_API_BASE%";
+        if (!base || base.charAt(0) === "%") return;
+        try {
+          window.__wake = fetch(base + "/api/v1/health", { mode: "cors", cache: "no-store" });
+          window.__wake.catch(function () {});
+        } catch (e) { /* the app polls anyway */ }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>This page needs JavaScript. The static report is at <a href="report.html">report.html</a>.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

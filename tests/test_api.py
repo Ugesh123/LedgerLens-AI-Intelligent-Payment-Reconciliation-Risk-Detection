@@ -1,0 +1,367 @@
+"""
+Tests for the JSON API the dashboard calls, and for the analysis payload it
+returns.
+
+The payload is checked for the properties the dashboard relies on rather than
+for exact figures (those are covered by the reconciliation tests): the money
+flow must conserve, every entity the engine examined must appear exactly once,
+and figures derived here must agree with the evaluator they are built on.
+"""
+
+from __future__ import annotations
+
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+pytest.importorskip("fastapi", reason="web layer is optional")
+from fastapi.testclient import TestClient  # noqa: E402
+
+import app as app_module  # noqa: E402
+from analysis import analyse, taxonomy_payload  # noqa: E402
+from evaluate import grade  # noqa: E402
+
+REF = ROOT / "datasets" / "01-reference"
+
+
+@pytest.fixture(scope="module")
+def client():
+    return TestClient(app_module.app)
+
+
+@pytest.fixture(scope="module")
+def payload():
+    return analyse(REF)
+
+
+def _files(d: Path, names=("ledger", "gateway", "bank", "settlements")):
+    return {n: (f"{n}.csv", (d / f"{n}.csv").read_bytes(), "text/csv")
+            for n in names}
+
+
+class TestAnalysisPayload:
+
+    def test_every_entity_appears_once(self, payload):
+        ids = [r["entity_id"] for r in payload["resolutions"]]
+        assert len(ids) == len(set(ids)) == payload["summary"]["entities"]
+
+    def test_figures_agree_with_the_evaluator(self, payload):
+        _, summ = grade(REF)
+        assert payload["summary"]["resolved"] == summ["resolved"]
+        assert payload["grading"]["accuracy"] == summ["accuracy"]
+
+    def test_money_flow_conserves_at_every_node(self, payload):
+        flow = payload["money_flow"]
+        inflow, outflow = defaultdict(int), defaultdict(int)
+        for link in flow["links"]:
+            assert link["value"] > 0
+            outflow[link["source"]] += link["value"]
+            inflow[link["target"]] += link["value"]
+        for node in inflow:
+            if node in outflow:
+                assert inflow[node] == outflow[node], flow["nodes"][node]
+
+    def test_money_stays_in_integer_paise(self, payload):
+        for r in payload["resolutions"]:
+            assert isinstance(r["amount_paise"], int)
+        for link in payload["money_flow"]["links"]:
+            assert isinstance(link["value"], int)
+
+    def test_every_emitted_class_has_a_severity(self, payload):
+        known = {c["label"] for c in taxonomy_payload()["classes"]}
+        for r in payload["resolutions"]:
+            assert r["classification"] in known
+            assert r["severity"] in {"ok", "expected", "review", "break"}
+
+    def test_unseen_batch_reports_detection(self):
+        p = analyse(ROOT / "datasets" / "08-unseen", include_records=False)
+        assert p["detection"]["silent"] == 0
+        assert p["records"] is None
+
+    def test_ordinary_batch_reports_no_detection(self, payload):
+        assert payload["detection"] is None
+
+
+class TestApi:
+
+    def test_datasets_are_listed(self, client):
+        names = {d["name"] for d in client.get("/api/v1/datasets").json()}
+        assert "01-reference" in names and "07-malformed" not in names
+
+    def test_a_bundled_dataset_reconciles(self, client):
+        r = client.post("/api/v1/datasets/01-reference")
+        assert r.status_code == 200
+        assert r.json()["grading"]["accuracy"] == 1.0
+
+    def test_an_unknown_dataset_is_refused(self, client):
+        assert client.post("/api/v1/datasets/nope").status_code == 404
+
+    def test_sample_parameters_are_bounded(self, client):
+        assert client.post("/api/v1/sample",
+                           json={"orders": 10_000_000}).status_code == 400
+        assert client.post("/api/v1/sample",
+                           json={"seed": "x"}).status_code == 400
+
+    def test_sample_generates(self, client):
+        r = client.post("/api/v1/sample", json={"seed": 5, "orders": 60})
+        assert r.status_code == 200
+        assert r.json()["sources"]["orders"] == 60
+
+    def test_upload_reconciles(self, client):
+        r = client.post("/api/v1/reconcile", files=_files(REF))
+        assert r.status_code == 200
+        assert r.json()["source"] == "Your upload"
+
+    def test_malformed_upload_names_the_column(self, client):
+        d = ROOT / "datasets" / "07-malformed"
+        r = client.post("/api/v1/reconcile",
+                        files=_files(d, ("ledger", "gateway", "bank")))
+        assert r.status_code == 400 and "order_id" in r.json()["detail"]
+
+    def test_oversized_upload_is_refused(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "MAX_BYTES", 1024)
+        r = client.post("/api/v1/reconcile", files=_files(REF))
+        assert r.status_code == 413
+
+    def test_taxonomy_is_served(self, client):
+        classes = client.get("/api/v1/taxonomy").json()["classes"]
+        assert any(c["label"] == "duplicate_bank_row" for c in classes)
+
+    def test_security_headers_are_set(self, client):
+        h = client.get("/api/v1/health").headers
+        assert h["x-content-type-options"] == "nosniff"
+        assert h["x-frame-options"] == "DENY"
+        assert h["cache-control"] == "no-store"
+
+    def test_cors_allows_the_pages_site_only(self, client):
+        ok = client.options("/api/v1/sample", headers={
+            "Origin": "https://rahulpaul-07.github.io",
+            "Access-Control-Request-Method": "POST"})
+        assert ok.headers["access-control-allow-origin"] == \
+            "https://rahulpaul-07.github.io"
+        bad = client.options("/api/v1/sample", headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST"})
+        assert "access-control-allow-origin" not in bad.headers
+
+    def test_head_works_on_the_routes_a_monitor_probes(self, client):
+        """
+        An uptime monitor sends HEAD by default. A route declaring only GET
+        answers 405, which most monitors report as an outage -- Render's own
+        prober was getting exactly that on the root.
+        """
+        for path in ("/", "/health"):
+            assert client.head(path).status_code == 200, path
+
+    def test_unknown_api_path_is_json_404(self, client):
+        r = client.get("/api/v1/nothing-here")
+        assert r.status_code == 404
+
+    def test_static_files_cannot_escape_the_build(self, client, tmp_path,
+                                                  monkeypatch):
+        (tmp_path / "index.html").write_text("<title>Three-way payment "
+                                             "reconciliation</title>")
+        monkeypatch.setattr(app_module, "WEB_DIST", tmp_path)
+        assert client.get("/").status_code == 200
+        assert client.get("/some/client/route").status_code == 200
+        r = client.get("/../src/app.py")
+        assert "SlidingWindowLimiter" not in r.text
+
+
+class TestLimits:
+
+    def test_a_visitor_key_does_not_spend_the_operator_budget(self,
+                                                              monkeypatch):
+        """
+        The page tells visitors to supply their own key to bypass the limit.
+        Before the limiter was split, the global check ran first and refused
+        them anyway.
+        """
+        op = app_module.SlidingWindowLimiter(1)
+        monkeypatch.setattr(app_module, "operator_limiter", op)
+        monkeypatch.setattr(app_module, "visitor_limiter",
+                            app_module.SlidingWindowLimiter(5))
+
+        class Req:
+            headers = {}
+            client = type("C", (), {"host": "1.2.3.4"})()
+
+        assert not app_module._model_rate_limited(Req(), None)
+        assert app_module._model_rate_limited(Req(), None)
+        assert not app_module._model_rate_limited(Req(), "sk-visitor")
+
+    def test_a_spoofed_forwarded_header_does_not_change_the_client(self):
+        class Req:
+            headers = {"x-forwarded-for": "9.9.9.9"}
+            client = type("C", (), {"host": "1.2.3.4"})()
+        assert app_module._client_id(Req()) == "1.2.3.4"
+
+    def test_client_id_ignores_a_spoofed_forwarded_header(self, monkeypatch):
+        """
+        Behind a trusted proxy (RECON_TRUST_PROXY=1).
+        The leftmost X-Forwarded-For entry is whatever the client sent. Keying
+        the per-client limit on it let a client rotate a fake header for a
+        fresh quota each request; only the proxy-appended rightmost entry
+        counts.
+        """
+        class Req:
+            client = type("C", (), {"host": "10.0.0.1"})()
+            def __init__(self, fwd):
+                self.headers = {"x-forwarded-for": fwd} if fwd else {}
+
+        monkeypatch.setattr(app_module, "TRUST_PROXY", True)
+        real = "203.0.113.9"
+        assert app_module._client_id(Req(f"1.1.1.1, {real}")) == real
+        assert app_module._client_id(Req(f"9.9.9.9, {real}")) == real
+        assert app_module._client_id(Req(None)) == "10.0.0.1"
+
+    def test_limiter_window_expires(self, monkeypatch):
+        lim = app_module.SlidingWindowLimiter(1, window_s=10)
+        now = [1000.0]
+        monkeypatch.setattr(app_module.time, "time", lambda: now[0])
+        assert not lim.hit("a")
+        assert lim.hit("a")
+        assert not lim.hit("b"), "buckets are independent"
+        now[0] += 11
+        assert not lim.hit("a")
+
+    def test_the_original_html_routes_share_the_engine_limit(self, client,
+                                                             monkeypatch):
+        """
+        `/sample` spawns the generator and `/reconcile` runs the engine, the
+        same work as their /api/v1 twins. They were unlimited, so the cap on
+        the JSON API could be sidestepped by calling the older route.
+        """
+        monkeypatch.setattr(app_module, "engine_limiter",
+                            app_module.SlidingWindowLimiter(1))
+        assert client.post("/api/v1/datasets/01-reference").status_code == 200
+        assert client.post("/sample").status_code == 429
+        r = client.post("/reconcile", files=_files(REF))
+        assert r.status_code == 429
+
+    def test_a_failed_sample_does_not_leak_paths(self, client, monkeypatch):
+        def boom():
+            raise RuntimeError(r"C:\\secret\\path\\python.exe exited 1")
+        monkeypatch.setattr(app_module, "_sample_batch", boom)
+        r = client.post("/sample")
+        assert r.status_code == 500
+        assert "secret" not in r.text and "python" not in r.text
+
+    @pytest.mark.parametrize("body", ["[1, 2]", '"text"', '{"question": 5}',
+                                      "null"])
+    def test_a_malformed_json_question_is_a_400_not_a_crash(self, client,
+                                                             body):
+        r = client.post("/api/v1/ask", content=body,
+                        headers={"content-type": "application/json"})
+        assert r.status_code == 400
+        assert r.json()["detail"] == "No question supplied."
+
+    def test_an_oversized_body_is_refused_before_it_is_parsed(self, client):
+        """
+        Declared too large: refused on the header alone, and the refusal
+        still carries the CORS header so the Pages site can show the reason.
+        """
+        limit = app_module.UPLOAD_FIELDS * app_module.MAX_BYTES + 64 * 1024
+        r = client.post("/api/v1/reconcile", content=b"x",
+                        headers={"content-length": str(limit + 1),
+                                 "content-type": "multipart/form-data; b=x",
+                                 "origin": "https://rahulpaul-07.github.io"})
+        assert r.status_code == 413
+        assert r.headers["access-control-allow-origin"] == \
+            "https://rahulpaul-07.github.io"
+
+    def test_an_undeclared_body_is_counted_as_it_arrives(self):
+        """A chunked body declares no length; the bytes are counted instead."""
+        import asyncio
+
+        async def inner(scope, receive, send):
+            while (await receive()).get("more_body"):
+                pass
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        mw = app_module.BodySizeLimit(inner, max_bytes=10)
+        chunks = [{"type": "http.request", "body": b"x" * 6, "more_body": True}
+                  for _ in range(3)]
+        sent = []
+
+        async def receive():
+            return chunks.pop(0)
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(mw({"type": "http", "headers": []}, receive, send))
+        assert sent[0]["status"] == 413
+
+    def test_a_slow_model_call_does_not_stall_other_requests(self,
+                                                             monkeypatch):
+        """
+        The model-backed handlers are async, and the agent's calls block. Run
+        on the event loop, one investigation froze the instance for its whole
+        duration: every other visitor, and the health check, waited behind it.
+        """
+        import asyncio
+        import time as _time
+
+        httpx2 = pytest.importorskip("httpx2")
+
+        class Fake:
+            available, name = True, "fake"
+
+        def slow(workdir, provider):
+            _time.sleep(1.5)
+            return []
+
+        monkeypatch.setattr(app_module, "_provider_for", lambda key: Fake())
+        monkeypatch.setattr(app_module, "_investigate_dir", slow)
+        monkeypatch.setattr(app_module, "_sample_batch",
+                            lambda: Path(app_module.tempfile.mkdtemp()))
+
+        async def scenario():
+            transport = httpx2.ASGITransport(app=app_module.app)
+            async with httpx2.AsyncClient(transport=transport,
+                                          base_url="http://t") as c:
+                slow_call = asyncio.create_task(
+                    c.post("/api/v1/investigate", json={}))
+                # Timed from before the pause: a blocked loop delays the
+                # pause itself, not only the request after it.
+                t0 = _time.perf_counter()
+                await asyncio.sleep(0.2)
+                health = await c.get("/health")
+                waited = _time.perf_counter() - t0
+                return (await slow_call).status_code, health.status_code, waited
+
+        slow_status, health_status, waited = asyncio.run(scenario())
+        assert slow_status == 200 and health_status == 200
+        assert waited < 1.0, f"health answered after {waited:.2f}s, behind the agent"
+
+    def test_limits_are_configurable_and_validated(self, monkeypatch):
+        monkeypatch.setenv("RECON_TEST_LIMIT", "17")
+        assert app_module._env_int("RECON_TEST_LIMIT", 5) == 17
+        monkeypatch.delenv("RECON_TEST_LIMIT")
+        assert app_module._env_int("RECON_TEST_LIMIT", 5) == 5
+        for bad in ("abc", "0", "-3"):
+            monkeypatch.setenv("RECON_TEST_LIMIT", bad)
+            with pytest.raises(SystemExit):
+                app_module._env_int("RECON_TEST_LIMIT", 5)
+
+    def test_a_visitor_key_never_touches_the_environment(self, monkeypatch):
+        import os
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        seen = []
+        real_setitem = os.environ.__class__.__setitem__
+
+        def spy(self, k, v):
+            seen.append(k)
+            return real_setitem(self, k, v)
+
+        monkeypatch.setattr(os.environ.__class__, "__setitem__", spy)
+        app_module._provider_for("sk-ant-not-a-real-key")
+        assert "ANTHROPIC_API_KEY" not in seen

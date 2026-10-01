@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* A Victorian counting-house ledger. Clerks wrote in iron-gall ink on cream
+   paper ruled in sepia, ticked what agreed in blue pencil, and entered what
+   did not in red ink, a convention older than double-entry textbooks. The
+   palette is that, and every colour keeps one meaning wherever it appears.
+   Brass is the only colour with no meaning: it is kept for ornament. */
+:root {
+  --paper: 242 234 216;     /* #F2EAD8 cream ledger paper             */
+  --sheet: 251 246 234;     /* #FBF6EA a fresh leaf for panels        */
+  --rule: 205 187 152;      /* #CDBB98 sepia ruling                   */
+  --ink: 43 29 20;          /* #2B1D14 iron-gall brown-black ink      */
+  --graphite: 106 88 70;    /* #6A5846 faded ink, secondary text      */
+  --tick: 30 63 115;        /* #1E3F73 Prussian blue pencil: matched  */
+  --redink: 140 28 19;      /* #8C1C13 oxblood red ink: a break       */
+  --pencil: 138 90 11;      /* #8A5A0B ochre: needs a person to look  */
+  --settled: 46 91 69;      /* #2E5B45 bottle green: explained        */
+  --brass: 156 122 60;      /* #9C7A3C ornament only                  */
+  color-scheme: light;
+}
+
+/* The same book read by gaslight. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: 23 17 13;       /* #17110D walnut           */
+    --sheet: 33 24 18;       /* #211812                  */
+    --rule: 74 59 44;        /* #4A3B2C                  */
+    --ink: 237 227 204;      /* #EDE3CC                  */
+    --graphite: 179 164 140; /* #B3A48C                  */
+    --tick: 143 176 224;     /* #8FB0E0                  */
+    --redink: 226 122 107;   /* #E27A6B                  */
+    --pencil: 217 169 78;    /* #D9A94E                  */
+    --settled: 134 190 152;  /* #86BE98                  */
+    --brass: 201 164 92;     /* #C9A45C                  */
+    color-scheme: dark;
+  }
+}
+
+@layer base {
+  html { scroll-behavior: smooth; scroll-padding-top: 4.5rem; }
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+    /* Paper darkens toward the edges of an old page. Two gradients, painted
+       once; no texture image and no filter. */
+    background-image:
+      radial-gradient(ellipse at 50% 0%, rgb(var(--sheet) / 0.9), transparent 60%),
+      radial-gradient(ellipse at 50% 50%, transparent 55%, rgb(var(--brass) / 0.10) 100%);
+    font-feature-settings: "tnum" 1, "lnum" 1;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  h1, h2, h3 { @apply font-serif text-ink; font-feature-settings: "lnum" 1, "kern" 1, "liga" 1, "dlig" 1; }
+  ::selection { background: rgb(var(--tick) / 0.22); }
+  :focus-visible { outline: 2px solid rgb(var(--tick)); outline-offset: 2px; border-radius: 3px; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+}
+
+@layer components {
+  /* Faint horizontal rules, the way a ledger page is printed. */
+  .ruled {
+    background-image: repeating-linear-gradient(
+      to bottom, transparent 0, transparent 31px, rgb(var(--rule) / 0.55) 31px, rgb(var(--rule) / 0.55) 32px);
+  }
+  /* The accountant's totals line: a single rule above, a double rule below. */
+  .totals { border-top: 1px solid rgb(var(--ink) / 0.8); border-bottom: 3px double rgb(var(--ink) / 0.8); }
+  /* An engraved frame: a hairline border and a second one set inside it,
+     the way a Victorian printer boxed a table. */
+  .engraved { border: 1px solid rgb(var(--rule)); outline: 1px solid rgb(var(--rule) / 0.75); outline-offset: -5px; }
+  /* A running head in letter-spaced small capitals. */
+  .smallcaps { font-variant-caps: all-small-caps; letter-spacing: 0.12em; }
+  /* A two-line drop capital on the first letter of an opening paragraph. */
+  .dropcap::first-letter {
+    float: left; font-family: "Playfair Display", Georgia, serif; font-weight: 700;
+    font-size: 3.35em; line-height: 0.82; padding: 0.06em 0.1em 0 0; color: rgb(var(--redink));
+  }
+  .num { font-variant-numeric: tabular-nums lining-nums; }
+  .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* Scroll reveal (components/ui/blur-fade.tsx). Hidden only when a script
+     has marked the page (html.js) and the reader allows motion, so the
+     prerendered page is fully visible without JavaScript.
+     The blur is an animation on the element being revealed, not part of the
+     hidden state: a blur filter on every hidden section at once cost around
+     300 ms of main-thread time at load (Lighthouse, mobile profile). */
+  .blur-fade { transition: opacity 0.7s ease-out, transform 0.7s cubic-bezier(0.16, 1, 0.3, 1); }
+  @media (prefers-reduced-motion: no-preference) {
+    html.js .blur-fade:not([data-shown]) { opacity: 0; transform: translateY(12px); }
+    html.js .blur-fade[data-shown] { animation: blur-in 0.7s ease-out; }
+  }
+  @keyframes blur-in { from { filter: blur(6px); } to { filter: blur(0); } }
+}

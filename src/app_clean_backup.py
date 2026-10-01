@@ -1,0 +1,1147 @@
+"""
+Web interface for the reconciliation engine.
+
+Upload a merchant ledger, a gateway report and a bank statement; the server
+runs the deterministic pipeline and returns the same report the command line
+produces.
+
+Two tiers of endpoint
+---------------------
+**Deterministic** (`/reconcile`, `/sample`) need no language model, no API key
+and no network. They are the reason the free tier is sufficient and the reason
+the service cannot fail because a vendor is down.
+
+**Model-backed** (`/investigate`, `/ask`) run the agent and the settlement Q&A.
+Exposing these publicly means either an operator key on a public server or
+asking a visitor for theirs, and both carry real cost. The compromise here:
+
+  * a key may come from the environment (operator's) or from a request header
+    (visitor's, never stored, never logged)
+  * requests are rate limited globally and capped at a few records each, so a
+    public endpoint cannot drain an operator's credit
+  * with no key from either source, the endpoints say so plainly rather than
+    failing obscurely
+
+Uploaded files are parsed in memory and written to a temporary directory that
+is deleted when the request completes. Nothing is stored.
+"""
+
+from __future__ import annotations
+
+import functools
+import os
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from collections import defaultdict, deque
+from pathlib import Path
+
+from fastapi import FastAPI, File, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
+
+SRC = Path(__file__).resolve().parent
+sys.path.insert(0, str(SRC))
+
+from analysis import DATASET_INFO, analyse, taxonomy_payload  # noqa: E402
+from matcher import Engine, load  # noqa: E402
+from report import build  # noqa: E402
+
+ROOT = SRC.parent
+DATASETS = ROOT / "datasets"
+# The built dashboard. Absent in a plain checkout (CI, the test suite), in which
+# case `/` falls back to the original single-page form so nothing depends on a
+# Node toolchain having run.
+WEB_DIST = Path(os.environ.get("RECON_WEB_DIST", ROOT / "web" / "dist"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """A positive integer setting from the environment, or the default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from None
+    if value <= 0:
+        raise SystemExit(f"{name} must be positive, got {value}")
+    return value
+
+
+MAX_BYTES = 8 * 1024 * 1024          # a 5,000-order batch is well under 1 MB
+REQUIRED = ("ledger", "gateway", "bank")
+UPLOAD_FIELDS = 5                    # ledger, gateway, bank, settlements, truth
+
+# Caps on the model-backed endpoints. These exist because the endpoints are
+# public and the cost is the operator's. Deliberately tight: the point is to
+# demonstrate the agent, not to offer a free reconciliation service.
+AGENT_MAX_RECORDS = 3
+RATE_LIMIT_PER_HOUR = _env_int("RECON_MODEL_LIMIT_PER_HOUR", 60)
+VISITOR_LIMIT_PER_HOUR = _env_int("RECON_VISITOR_LIMIT_PER_HOUR", 30)
+ENGINE_LIMIT_PER_HOUR = _env_int("RECON_ENGINE_LIMIT_PER_HOUR", 240)
+
+
+class _BodyTooLarge(Exception):
+    pass
+
+
+class BodySizeLimit:
+    """
+    Refuse a request body larger than `max_bytes` before it is parsed.
+
+    The per-file check in `_read_bounded` runs inside the handler, and by then
+    the multipart parser has already received and spooled the whole body. This
+    rejects on the declared Content-Length up front, and counts the bytes of a
+    body that declares none (chunked), so an oversized upload costs the server
+    at most `max_bytes` of reading however it is sent.
+    """
+
+    def __init__(self, app, max_bytes: int):
+        self.app, self.max_bytes = app, max_bytes
+
+    async def _refuse(self, send) -> None:
+        body = (b'{"detail":"request body is larger than '
+                + str(self.max_bytes // 1024 // 1024).encode() + b' MB"}')
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode())]})
+        await send({"type": "http.response.body", "body": body})
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None:
+            try:
+                too_big = int(declared) > self.max_bytes
+            except ValueError:
+                too_big = True
+            if too_big:
+                return await self._refuse(send)
+
+        seen, started = 0, False
+
+        async def counted_receive():
+            nonlocal seen
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.max_bytes:
+                    raise _BodyTooLarge
+            return message
+
+        async def tracked_send(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counted_receive, tracked_send)
+        except _BodyTooLarge:
+            if not started:
+                await self._refuse(send)
+
+
+app = FastAPI(
+    title="Three-way reconciliation",
+    version="2.0.0",
+    description=("Reconciles a merchant ledger, a payment gateway report and a "
+                 "bank statement. The deterministic endpoints need no API key."),
+    docs_url="/api/docs", redoc_url=None, openapi_url="/api/openapi.json",
+)
+# Registered first so it sits inside CORS and the security headers: a 413
+# must still carry the CORS header, or the Pages site cannot read the reason.
+app.add_middleware(BodySizeLimit,
+                   max_bytes=UPLOAD_FIELDS * MAX_BYTES + 64 * 1024)
+app.add_middleware(GZipMiddleware, minimum_size=2048)
+
+# The static site on GitHub Pages calls this API cross-origin. Only the origins
+# listed may, and none of the endpoints use cookies, so credentials stay off.
+_ORIGINS = [o.strip() for o in os.environ.get(
+    "RECON_CORS_ORIGINS",
+    "https://rahulpaul-07.github.io,http://localhost:5173,http://127.0.0.1:5173",
+).split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_ORIGINS,
+                   allow_methods=["GET", "POST"],
+                   allow_headers=["content-type", "x-api-key"],
+                   allow_credentials=False, max_age=3600)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.url.path.startswith("/api/"):
+        h.setdefault("Cache-Control", "no-store")
+    return response
+
+class SlidingWindowLimiter:
+    """
+    Per-bucket sliding-window limit, in memory, per process.
+
+    Adequate for a single free-tier instance; a horizontally scaled deployment
+    would move this to a shared store such as Redis. Thread-safe because the
+    synchronous endpoints run in a worker pool.
+    """
+
+    def __init__(self, limit: int, window_s: float = 3600.0):
+        self.limit, self.window = limit, window_s
+        self._hits: dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def hit(self, bucket: str = "global") -> bool:
+        """Record a request. True means it is over the limit and refused."""
+        now = time.time()
+        with self._lock:
+            q = self._hits[bucket]
+            while q and now - q[0] >= self.window:
+                q.popleft()
+            if len(q) >= self.limit:
+                return True
+            q.append(now)
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._hits.clear()
+
+
+# Requests paid for by the operator's key share one global budget. Requests
+# that bring their own key do not spend it -- the page says so, and before
+# this split it was untrue: the global check ran first, so a visitor with a
+# key was refused once the operator's quota was gone.
+operator_limiter = SlidingWindowLimiter(RATE_LIMIT_PER_HOUR)
+visitor_limiter = SlidingWindowLimiter(VISITOR_LIMIT_PER_HOUR)
+# The deterministic endpoints cost CPU, not money. A generous per-client cap
+# keeps one client from monopolising a free-tier instance. Every endpoint that
+# runs the engine or spawns the generator shares it, the original HTML routes
+# included.
+engine_limiter = SlidingWindowLimiter(ENGINE_LIMIT_PER_HOUR)
+
+# Kept for compatibility with callers and tests written against the original
+# single-list limiter.
+_calls = operator_limiter._hits["global"]
+
+
+def _rate_limited() -> bool:
+    return operator_limiter.hit("global")
+
+
+# Set on deployments that sit behind exactly one appending proxy (Render).
+# Off by default: without a proxy in front, every X-Forwarded-For entry,
+# rightmost included, comes from the client.
+TRUST_PROXY = os.environ.get("RECON_TRUST_PROXY", "").lower() in ("1", "true", "yes")
+
+
+def _client_id(request: Request) -> str:
+    """
+    The address a per-client limit is keyed on.
+
+    Behind a proxy the socket peer is the proxy, so the real client is in
+    X-Forwarded-For -- but only the RIGHTMOST entry, the one the proxy itself
+    appended, can be trusted. Everything to its left arrived from the client.
+    An earlier version delegated this to uvicorn run with
+    --forwarded-allow-ips='*', which resolves to the LEFTMOST entry: a client
+    could rotate a fake header and get a fresh quota on every request.
+    """
+    if TRUST_PROXY:
+        fwd = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",")
+               if h.strip()]
+        if fwd:
+            return fwd[-1]
+    return request.client.host if request.client else "unknown"
+
+
+def _model_rate_limited(request: Request, visitor_key: str | None) -> bool:
+    if visitor_key:
+        return visitor_limiter.hit(_client_id(request))
+    return operator_limiter.hit("global")
+
+
+def _provider_for(request_key: str | None):
+    """
+    Resolve a provider, preferring a key supplied with the request.
+
+    A visitor's key is handed straight to one Anthropic client for that
+    request. It is never written to the environment, disk or logs. The
+    original version set it in os.environ and restored it afterwards, which
+    had two problems: the variable was briefly visible to anything else
+    running in the process, and the visitor's request was served by the full
+    failover chain -- so a failing visitor key fell through to the operator's
+    other providers and spent the operator's money on the visitor's request.
+    """
+    from llm import AnthropicProvider, get_provider
+    if request_key:
+        return AnthropicProvider(api_key=request_key)
+    return get_provider()
+
+
+PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Three-way reconciliation</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0f0f0f;color:#e8e6e3;font:15px/1.6 ui-sans-serif,-apple-system,
+     "Segoe UI",system-ui,sans-serif;padding:48px 24px;max-width:820px;margin:0 auto}
+h1{font-size:27px;font-weight:600;letter-spacing:-.02em}
+.sub{color:#8b8680;font-size:14px;margin:8px 0 22px}
+.stats{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 9px}
+.stat{flex:1 1 148px;background:#161616;border:1px solid #262626;
+     border-radius:9px;padding:14px 16px}
+.stat .n{font-size:22px;font-weight:600;color:#d9a441;
+     font-variant-numeric:tabular-nums}
+.stat .l{font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+     color:#8b8680;margin-top:5px;line-height:1.4}
+.statnote{font-size:12.5px;color:#5f5a55;margin:0 0 30px;line-height:1.6}
+.card{background:#161616;border:1px solid #262626;border-radius:9px;padding:22px;
+      margin-bottom:16px}
+label{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.07em;
+      color:#8b8680;margin-bottom:7px}
+.field{margin-bottom:16px}
+.opt{color:#5f5a55;text-transform:none;letter-spacing:0;font-size:12px}
+input[type=file]{width:100%;background:#0f0f0f;border:1px solid #2a2a2a;
+     border-radius:6px;padding:9px 11px;color:#b8b3ad;font-size:13px}
+input[type=file]::file-selector-button{background:#232323;border:0;color:#d8d4cf;
+     padding:5px 12px;border-radius:5px;margin-right:11px;cursor:pointer;
+     font-size:12.5px}
+button{background:#d9a441;color:#0f0f0f;border:0;border-radius:6px;
+     padding:11px 22px;font-size:14px;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button.ghost{background:#232323;color:#d8d4cf;font-weight:500;margin-left:9px}
+.note{font-size:13px;color:#8b8680;margin-top:14px;line-height:1.65}
+.err{background:#2a1818;border-left:2px solid #c05a4a;padding:13px 16px;
+     border-radius:0 6px 6px 0;color:#e0b0a4;font-size:13.5px;margin-top:16px;
+     white-space:pre-wrap}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
+     color:#b8b3ad}
+</style></head><body>
+
+<h1>Three-way payment reconciliation</h1>
+<div class="sub">Upload a merchant ledger, a payment gateway report and a bank
+statement. The engine matches them, reports what it resolved and how certain
+each resolution is, and lists every record it could not resolve with a
+reason.</div>
+
+<div class="stats">
+  <div class="stat"><div class="n">90.8%</div><div class="l">resolved</div></div>
+  <div class="stat"><div class="n">100%</div><div class="l">classification accuracy</div></div>
+  <div class="stat"><div class="n">179</div><div class="l">tests, Python 3.10&ndash;3.13</div></div>
+  <div class="stat"><div class="n">7</div><div class="l">providers, scoped failover</div></div>
+</div>
+<div class="statnote">Measured on the reference batch against a ground-truth
+answer key the engine never reads, not on a real merchant&rsquo;s books. Every
+figure is reproducible from the repository.</div>
+
+<form id="f" class="card">
+  <div class="field"><label>Merchant ledger <span class="opt">— order_id,
+    order_amount_paise, order_datetime, payment_method, order_status</span></label>
+    <input type="file" name="ledger" accept=".csv" required></div>
+
+  <div class="field"><label>Gateway report <span class="opt">— txn_id, txn_type,
+    order_ref, gross_amount_paise, fee_paise, net_amount_paise,
+    settlement_id</span></label>
+    <input type="file" name="gateway" accept=".csv" required></div>
+
+  <div class="field"><label>Bank statement <span class="opt">— bank_txn_id,
+    value_date, description, credit_paise, debit_paise, balance_paise,
+    utr</span></label>
+    <input type="file" name="bank" accept=".csv" required></div>
+
+  <div class="field"><label>Settlement report <span class="opt">— optional;
+    links gateway payments to bank credits</span></label>
+    <input type="file" name="settlements" accept=".csv"></div>
+
+  <div class="field"><label>Ground truth <span class="opt">— optional; if
+    supplied, the report includes measured accuracy per class</span></label>
+    <input type="file" name="ground_truth" accept=".csv"></div>
+
+  <button type="submit" id="go">Reconcile</button>
+  <button type="button" class="ghost" id="sample">Use the sample batch</button>
+</form>
+
+<div id="err"></div>
+
+<div class="note">
+Files are parsed in memory and deleted when the request completes; nothing is
+stored. The reconciliation above runs the deterministic engine only &mdash; no
+language model is involved, so there is no API key and no per-request cost. The
+model-backed layers below do need a key, and it is used for that one request
+only &mdash; never stored, never logged.
+<br><br>
+Amounts are integer paise: <code>45000</code> means &#8377;450.00.
+</div>
+
+<h1 style="font-size:20px;margin-top:44px">Try the AI layers</h1>
+<div class="sub">If you have chosen the three files above, both layers answer about those
+files &mdash; they are sent with the request and deleted with the response,
+so nothing is kept between calls. With no files chosen they run against a
+freshly generated sample batch. Both need a language model; the
+reconciliation above does not.</div>
+
+<div class="card">
+  <div class="field">
+    <label>API key <span class="opt">— optional. Used for this request only,
+      never stored or logged. Leave blank to use the server's key if one is
+      configured.</span></label>
+    <input type="password" id="key" placeholder="sk-ant-..." autocomplete="off"
+      style="width:100%;background:#0f0f0f;border:1px solid #2a2a2a;
+             border-radius:6px;padding:9px 11px;color:#b8b3ad;font-size:13px">
+  </div>
+
+  <div class="field">
+    <label>Ask a question about the batch</label>
+    <input type="text" id="q" value="How much did I pay in fees, and which method costs most?"
+      style="width:100%;background:#0f0f0f;border:1px solid #2a2a2a;
+             border-radius:6px;padding:9px 11px;color:#e8e6e3;font-size:13px">
+  </div>
+
+  <button type="button" id="askBtn">Ask</button>
+  <button type="button" class="ghost" id="invBtn">Investigate 3 exceptions</button>
+  <div id="ai"></div>
+</div>
+
+<script>
+const form = document.getElementById('f');
+const err  = document.getElementById('err');
+const go   = document.getElementById('go');
+
+function fail(msg){ err.innerHTML = '<div class="err">' + msg + '</div>'; }
+
+async function send(url, body){
+  err.innerHTML = ''; go.disabled = true; go.textContent = 'Reconciling...';
+  try {
+    const r = await fetch(url, body ? {method:'POST', body} : {method:'POST'});
+    if (!r.ok) { const j = await r.json().catch(() => ({detail:'request failed'}));
+                 fail(j.detail || 'request failed'); return; }
+    // Open the report in its own tab. Writing it over this page leaves no
+    // history entry, so the back button does nothing and the visitor has to
+    // retype the URL to reach the upload form again.
+    const html = await r.text();
+    const w = window.open('', '_blank');
+    if (w) { w.document.open(); w.document.write(html); w.document.close();
+             err.innerHTML = '<div class="note" style="margin-top:16px">' +
+               'Report opened in a new tab.</div>'; }
+    else {  // pop-up blocked: fall back to a download rather than losing it
+      const url = URL.createObjectURL(new Blob([html], {type:'text/html'}));
+      const a = document.createElement('a');
+      a.href = url; a.download = 'reconciliation-report.html'; a.click();
+      URL.revokeObjectURL(url);
+      err.innerHTML = '<div class="note" style="margin-top:16px">' +
+        'Pop-up blocked, so the report was downloaded instead.</div>';
+    }
+    // The selections are deliberately kept. The AI layers below answer about
+    // whatever is chosen here, so clearing them after a reconcile would
+    // silently switch those answers back to the sample batch.
+  } catch (e) { fail('Could not reach the server: ' + e.message); }
+  finally { go.disabled = false; go.textContent = 'Reconcile'; }
+}
+
+form.addEventListener('submit', e => { e.preventDefault();
+  send('/reconcile', new FormData(form)); });
+document.getElementById('sample').addEventListener('click', () =>
+  send('/sample', null));
+
+const ai = document.getElementById('ai');
+const esc = t => String(t).replace(/[&<>]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function busy(msg){ ai.innerHTML =
+  '<div class="note" style="margin-top:16px">' + msg + '</div>'; }
+
+function chosenFiles(){
+  const out = {};
+  for (const n of ['ledger','gateway','bank','settlements']){
+    const el = form.querySelector('[name="' + n + '"]');
+    if (el && el.files && el.files.length) out[n] = el.files[0];
+  }
+  return out;
+}
+
+function usingOwnFiles(){
+  const f = chosenFiles();
+  return !!(f.ledger && f.gateway && f.bank);
+}
+
+async function callAI(url, body){
+  // Both AI calls are slow enough to invite an impatient second click,
+  // which would spend the rate limit twice and race the two responses.
+  const btns = ['askBtn','invBtn'].map(i => document.getElementById(i));
+  btns.forEach(b => b.disabled = true);
+  try {
+    const key = document.getElementById('key').value.trim();
+    const headers = {};
+    if (key) headers['x-api-key'] = key;
+    // When the three required files are chosen, they travel with this request
+    // and the layers answer about them. They are deleted with the response --
+    // nothing is held server-side between calls, so the only way to ask about
+    // your own books is to send them with the question.
+    let payload = null;
+    if (usingOwnFiles()){
+      payload = new FormData();
+      const files = chosenFiles();
+      for (const n in files) payload.append(n, files[n]);
+      if (body && body.question) payload.append('question', body.question);
+    } else if (body) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body);
+    }
+    const r = await fetch(url, {method:'POST', headers, body: payload});
+    return {ok: r.ok, data: await r.json()};
+  } finally { btns.forEach(b => b.disabled = false); }
+}
+
+function sourceLine(data){
+  return '<div class="note" style="margin-top:10px">Answered about <b>' +
+         esc(data.source || 'sample batch') + '</b>.</div>';
+}
+
+document.getElementById('askBtn').addEventListener('click', async () => {
+  busy('Asking about ' + (usingOwnFiles() ? 'your uploaded files' : 'a freshly generated sample batch') +
+    '. The model writes a structured query, the server runs it, and the model explains the real result...');
+  const {ok, data} = await callAI('/ask', {question: document.getElementById('q').value});
+  if (!ok) { ai.innerHTML = '<div class="err">' + esc(data.detail) + '</div>'; return; }
+  ai.innerHTML =
+    '<div class="card" style="margin-top:16px;background:#131313">' +
+    '<div style="font-size:14px;line-height:1.7">' + esc(data.answer || data.error) + '</div>' +
+    '<div class="note" style="margin-top:12px"><code>' +
+      esc((data.tools_used||[]).join(', ') || 'no query') + '</code> &middot; ' +
+      data.model_calls + ' model call(s)</div>' + sourceLine(data) +
+    '<div class="err" style="background:#1c1a14;border-left-color:#7a6020;color:#c9bfa0">' +
+      esc(data.caveat) + '</div></div>';
+});
+
+document.getElementById('invBtn').addEventListener('click', async () => {
+  busy('Investigating ' + (usingOwnFiles() ? 'your uploaded files' : 'a freshly generated sample batch') +
+    '. The agent picks its own tools from nine deterministic checks, up to five rounds per record. This takes about a minute...');
+  const {ok, data} = await callAI('/investigate', null);
+  if (!ok) { ai.innerHTML = '<div class="err">' + esc(data.detail) + '</div>'; return; }
+  let h = '<div class="note" style="margin-top:16px">Answered by <code>' +
+          esc(data.provider) + '</code>, capped at ' + data.capped_at +
+          ' records, about <b>' + esc(data.source || 'sample batch') +
+          '</b>.</div>';
+  for (const inv of data.investigations){
+    h += '<div class="card" style="margin-top:12px;background:#131313">' +
+      '<div style="font-size:13px"><code>' + esc(inv.entity_id) + '</code> &mdash; ' +
+      'matcher said <code>' + esc(inv.matcher_said) + '</code>, agent said <code>' +
+      esc(inv.agent_said) + '</code>' +
+      (inv.agreed ? '' : ' <span style="color:#d9a441">(disagreed)</span>') + '</div>' +
+      '<div style="margin:12px 0;border-left:1px solid #2a2a2a;padding-left:14px">';
+    for (const s of inv.steps){
+      h += '<div style="font-size:12.5px;padding:3px 0"><span style="color:#5f5a55">' +
+           s.n + '</span> <code style="color:#8fa8c7">' + esc(s.tool) + '</code> ' +
+           '<span style="color:#918c86">' + esc(s.summary) + '</span></div>';
+    }
+    h += '</div><div style="font-size:13.5px;color:#c2bdb7">' +
+         esc(inv.reasoning) + '</div>';
+    if (inv.analyst_note)
+      h += '<div class="note" style="border-left:2px solid #4a4a4a;padding-left:13px;margin-top:10px"><strong>For the analyst.</strong> ' +
+           esc(inv.analyst_note) + '</div>';
+    h += '</div>';
+  }
+  ai.innerHTML = h;
+});
+</script>
+</body></html>"""
+
+
+SETTLEMENTS_HEADER = "settlement_id,capture_date,payout_date,total_paise,utr\n"
+TRUTH_HEADER = ("entity_id,entity_type,expected_classification,"
+                "expected_match_target,notes\n")
+
+
+def _write_stubs(workdir: Path) -> None:
+    """
+    The loader expects every file to exist. A settlement report is optional in
+    an upload, and an empty one is honest: it means every bank row has to be
+    matched by inference rather than by reference. Written in one place; it
+    had been copied into three handlers.
+    """
+    if not (workdir / "settlements.csv").exists():
+        (workdir / "settlements.csv").write_text(SETTLEMENTS_HEADER,
+                                                 encoding="utf-8")
+    if not (workdir / "ground_truth.csv").exists():
+        (workdir / "ground_truth.csv").write_text(TRUTH_HEADER,
+                                                  encoding="utf-8")
+
+
+async def _read_bounded(f) -> bytes | None:
+    """
+    Read an upload, refusing it once it passes MAX_BYTES.
+
+    This is the per-file limit, reported against the file that broke it.
+    The request as a whole is bounded earlier, by `BodySizeLimit`, before the
+    multipart parser has read anything. Reading one byte past the limit is
+    enough to know it was exceeded.
+    """
+    data = await f.read(MAX_BYTES + 1)
+    return None if len(data) > MAX_BYTES else data
+
+
+def _spa_index() -> Path | None:
+    idx = WEB_DIST / "index.html"
+    return idx if idx.is_file() else None
+
+
+# HEAD as well as GET: an uptime monitor defaults to HEAD, and a route that
+# declares only GET answers it with 405, which most monitors read as down.
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse,
+               include_in_schema=False)
+def index():
+    idx = _spa_index()
+    return FileResponse(idx) if idx else HTMLResponse(PAGE)
+
+
+@app.get("/classic", response_class=HTMLResponse, include_in_schema=False)
+def classic() -> str:
+    """The original single-page form, kept for anyone linked to it."""
+    return PAGE
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health() -> dict:
+    return {"status": "ok", "model_required": False}
+
+
+def _reconcile_dir(workdir: Path) -> str:
+    """Run the pipeline over a directory and return the report HTML."""
+    orders, txns, settlements, bank = load(workdir)
+    if not orders:
+        raise ValueError("the ledger contains no rows")
+
+    Engine(orders, txns, settlements, bank).run()
+
+    out = workdir / "report.html"
+    build(workdir, out)
+    return out.read_text(encoding="utf-8")
+
+
+@app.post("/sample", response_class=HTMLResponse)
+def sample(request: Request) -> HTMLResponse:
+    """
+    Reconcile a freshly generated batch.
+
+    Present so a reviewer with no CSVs to hand still sees the system work. The
+    batch is generated per request rather than served from disk, so the numbers
+    are produced live rather than recalled.
+    """
+    if (limited := _engine_limited(request)):
+        return limited
+    tmp: Path | None = None
+    try:
+        tmp = _sample_batch()
+        return HTMLResponse(_reconcile_dir(tmp))
+    except Exception:                                     # noqa: BLE001
+        # The exception names the interpreter and temporary paths; it goes to
+        # the log, and the visitor gets a message that exposes neither.
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500,
+                            content={"detail": "sample generation failed"})
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.post("/reconcile", response_class=HTMLResponse)
+async def reconcile(
+    request: Request,
+    ledger: UploadFile = File(...),
+    gateway: UploadFile = File(...),
+    bank: UploadFile = File(...),
+    settlements: UploadFile | None = File(None),
+    ground_truth: UploadFile | None = File(None),
+) -> HTMLResponse:
+    if (limited := _engine_limited(request)):
+        return limited
+    tmp = Path(tempfile.mkdtemp(prefix="recon-"))
+    try:
+        uploads = {"ledger": ledger, "gateway": gateway, "bank": bank,
+                   "settlements": settlements, "ground_truth": ground_truth}
+
+        for name, f in uploads.items():
+            if f is None:
+                continue
+            data = await _read_bounded(f)
+            if data is None:
+                return JSONResponse(status_code=413, content={
+                    "detail": f"{name}.csv is larger than "
+                              f"{MAX_BYTES // 1024 // 1024} MB"})
+            if not data.strip():
+                if name in REQUIRED:
+                    return JSONResponse(status_code=400, content={
+                        "detail": f"{name}.csv is empty"})
+                continue
+            (tmp / f"{name}.csv").write_bytes(data)
+
+        _write_stubs(tmp)
+        return HTMLResponse(await run_in_threadpool(_reconcile_dir, tmp))
+
+    except KeyError as exc:
+        # Most likely cause by far: a column the engine needs is absent.
+        return JSONResponse(status_code=400, content={
+            "detail": f"A required column is missing: {exc}. Check the field "
+                      f"names listed beside each upload."})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={
+            "detail": f"Could not parse the files: {exc}"})
+    except Exception:                                     # noqa: BLE001
+        # The trace goes to the server log, not to the response. A public
+        # endpoint should not hand a visitor absolute paths and internals.
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500, content={
+            "detail": "Reconciliation failed. The files parsed but the " +
+                      "engine could not complete. Check that each file " +
+                      "has the columns listed beside its upload field."})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Model-backed endpoints
+# --------------------------------------------------------------------------
+
+def _sample_batch() -> Path:
+    """Generate the seed-42 reference batch into a new temporary directory."""
+    import subprocess
+    tmp = Path(tempfile.mkdtemp(prefix="recon-sample-"))
+    try:
+        subprocess.run(
+            [sys.executable, str(SRC / "generate_data.py"),
+             "--seed", "42", "--orders", "120", "--out", str(tmp)],
+            check=True, capture_output=True, timeout=60)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return tmp
+
+
+async def _read_request(request: Request) -> tuple[str, Path | None, str | None]:
+    """
+    Read one model-backed request, in either of the two shapes it accepts.
+
+    Multipart carries the same CSVs the reconcile form takes, so the question
+    is answered about the caller's own books. JSON carries none, and a sample
+    batch is generated instead.
+
+    Uploads are written to a throwaway directory and deleted with the response,
+    exactly as /reconcile does. Nothing survives the request: the answer is
+    always about files supplied in the same call, never about state the server
+    kept between calls. That is what keeps the storage claim on the page true.
+
+    Returns (question, upload_dir_or_None, error). A None directory means the
+    caller supplied no files and the sample batch should be used.
+    """
+    ctype = request.headers.get("content-type", "")
+    if not ctype.startswith("multipart/form-data"):
+        try:
+            body = await request.json()
+        except Exception:                                 # noqa: BLE001
+            body = {}
+        # Anything but an object with a string question is treated as no
+        # question, which the caller turns into a 400 rather than a 500.
+        question = body.get("question") if isinstance(body, dict) else None
+        return (question.strip() if isinstance(question, str) else ""), None, None
+
+    form = await request.form()
+    question = str(form.get("question") or "").strip()
+    named = {n: form.get(n)
+             for n in ("ledger", "gateway", "bank", "settlements")}
+    supplied = {n: f for n, f in named.items()
+                if hasattr(f, "read") and getattr(f, "filename", "")}
+
+    if not any(n in supplied for n in REQUIRED):
+        return question, None, None
+
+    missing = [n for n in REQUIRED if n not in supplied]
+    if missing:
+        return question, None, (
+            f"{missing[0]}.csv is missing. Asking about your own data needs "
+            f"all three of ledger, gateway and bank.")
+
+    tmp = Path(tempfile.mkdtemp(prefix="recon-"))
+    try:
+        for name, f in supplied.items():
+            data = await _read_bounded(f)
+            if data is None:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return question, None, (
+                    f"{name}.csv is larger than "
+                    f"{MAX_BYTES // 1024 // 1024} MB")
+            if not data.strip():
+                if name in REQUIRED:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    return question, None, f"{name}.csv is empty"
+                continue
+            (tmp / f"{name}.csv").write_bytes(data)
+
+        _write_stubs(tmp)
+
+        # Validate here rather than in the handler. Two reasons: the handler
+        # runs after the provider check, so a bad batch would otherwise fail
+        # as an opaque 500 while the identical upload to /reconcile gets a
+        # message naming the column; and rejecting unreadable files before any
+        # model call means a typo in a header costs nothing.
+        try:
+            load(tmp)
+        except KeyError as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return question, None, (
+                f"A required column is missing: {exc}. Check the field names "
+                f"listed beside each upload.")
+        except ValueError as exc:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return question, None, f"Could not parse the files: {exc}"
+
+        return question, tmp, None
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def _investigate_dir(workdir: Path, provider) -> list[dict]:
+    """Reconcile a batch and run the agent over its first unresolved records."""
+    from agent import ResolutionAgent, build_context
+    from investigate import facts_for
+    from tools import InvestigationTools
+
+    orders, txns, settlements, bank = load(workdir)
+    resolutions = Engine(orders, txns, settlements, bank).run()
+    unresolved = [r for r in resolutions if not r.resolved][:AGENT_MAX_RECORDS]
+
+    agent = ResolutionAgent(InvestigationTools(orders, txns, settlements, bank),
+                            provider=provider)
+    out = []
+    for r in unresolved:
+        ctx = build_context(r.entity_id, r.entity_type, r.detail,
+                            facts_for(r, orders, txns, settlements, bank))
+        a = agent.investigate(r.entity_id, r.entity_type, ctx)
+        out.append({
+            "entity_id": a.entity_id,
+            "matcher_said": r.classification,
+            "agent_said": a.classification,
+            "agreed": a.classification == r.classification,
+            "reasoning": a.reasoning,
+            "analyst_note": a.analyst_note,
+            "terminated": a.terminated,
+            "steps": [{"n": s.n, "tool": s.tool, "input": s.tool_input,
+                       "ok": s.ok, "summary": s.summary} for s in a.steps],
+        })
+    return out
+
+
+def _ask_dir(workdir: Path, provider, question: str):
+    """Reconcile a batch and answer one question about it."""
+    from ask import QAAgent, QueryTools
+
+    orders, txns, settlements, bank = load(workdir)
+    resolutions = Engine(orders, txns, settlements, bank).run()
+    tools = QueryTools(orders, txns, settlements, bank, resolutions)
+    return QAAgent(tools, provider=provider).ask(question)
+
+
+def _rate_limit_response(visitor_key: str | None) -> JSONResponse:
+    if visitor_key:
+        detail = (f"Rate limit reached ({VISITOR_LIMIT_PER_HOUR}/hour per "
+                  f"client, even with your own key).")
+    else:
+        detail = (f"Rate limit reached ({RATE_LIMIT_PER_HOUR}/hour). The "
+                  f"model-backed endpoints are capped because the cost is "
+                  f"the operator's. Supply your own key to bypass this.")
+    return JSONResponse(status_code=429, content={"detail": detail})
+
+
+@app.post("/investigate")
+async def investigate(request: Request) -> JSONResponse:
+    """
+    Run the resolution agent over the first few unresolved records.
+
+    Capped at AGENT_MAX_RECORDS. Each investigation is several model calls, so
+    an uncapped public endpoint would be an invitation to spend someone else's
+    money.
+    """
+    key = request.headers.get("x-api-key") or None
+    if _model_rate_limited(request, key):
+        return _rate_limit_response(key)
+
+    provider = _provider_for(key)
+    if not provider.available:
+        return JSONResponse(status_code=503, content={
+            "detail": "No language model is configured. Set ANTHROPIC_API_KEY "
+                      "on the server, or paste a key in the field above — it "
+                      "is used for this request only and never stored.",
+            "reason": getattr(provider, "reason", "unconfigured")})
+
+    _q, updir, err = await _read_request(request)
+    if err:
+        return JSONResponse(status_code=400, content={"detail": err})
+
+    tmp = updir or await run_in_threadpool(_sample_batch)
+    try:
+        # Model calls block for seconds each. Run off the event loop, or one
+        # investigation stalls every other request on the instance, health
+        # checks included.
+        out = await run_in_threadpool(_investigate_dir, tmp, provider)
+        return JSONResponse({"provider": getattr(provider, "name", "?"),
+                             "capped_at": AGENT_MAX_RECORDS,
+                             "source": "your files" if updir else "sample batch",
+                             "investigations": out})
+    except Exception:                                     # noqa: BLE001
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500, content={
+            "detail": "The investigation could not complete. If you supplied "
+                      "your own files, check they have the columns listed "
+                      "beside each upload field."})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.post("/ask")
+async def ask(request: Request) -> JSONResponse:
+    """Answer one plain-English question about the sample batch."""
+    key = request.headers.get("x-api-key") or None
+    if _model_rate_limited(request, key):
+        return _rate_limit_response(key)
+
+    question, updir, err = await _read_request(request)
+    if err:
+        return JSONResponse(status_code=400, content={"detail": err})
+    if not question or len(question) > 400:
+        if updir:
+            shutil.rmtree(updir, ignore_errors=True)
+        return JSONResponse(status_code=400, content={
+            "detail": "No question supplied." if not question
+                      else "Question is too long."})
+
+    provider = _provider_for(key)
+    if not provider.available:
+        if updir:
+            shutil.rmtree(updir, ignore_errors=True)
+        return JSONResponse(status_code=503, content={
+            "detail": "No language model is configured. Set ANTHROPIC_API_KEY "
+                      "on the server, or paste a key above — used for this "
+                      "request only, never stored."})
+
+    tmp = updir or await run_in_threadpool(_sample_batch)
+    try:
+        a = await run_in_threadpool(_ask_dir, tmp, provider, question)
+        return JSONResponse({
+            "question": a.question, "answer": a.text, "error": a.error,
+            "tools_used": a.tools_used, "model_calls": a.model_calls,
+            "source": "your files" if updir else "sample batch",
+            "caveat": ("Every figure came from a query result, but the rule "
+                       "against combining figures lives in the prompt rather "
+                       "than in code. This layer has a weaker guarantee than "
+                       "the resolution agent."),
+        })
+    except Exception:                                     # noqa: BLE001
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500, content={
+            "detail": "The question could not be answered. If you supplied "
+                      "your own files, check they have the columns listed "
+                      "beside each upload field."})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# JSON API (v1) -- what the dashboard calls
+# --------------------------------------------------------------------------
+# Same engine, same guarantees as the HTML endpoints above; the difference is
+# only the shape of the response. None of these needs a language model.
+
+def _engine_limited(request: Request) -> JSONResponse | None:
+    if engine_limiter.hit(_client_id(request)):
+        return JSONResponse(status_code=429, content={
+            "detail": "Too many reconciliations from this client in the last "
+                      "hour. The engine is free to run locally: see the README."})
+    return None
+
+
+def _analyse_or_error(workdir: Path, source: str) -> JSONResponse:
+    try:
+        return JSONResponse(analyse(workdir, source=source))
+    except KeyError as exc:
+        return JSONResponse(status_code=400, content={
+            "detail": f"A required column is missing: {exc}. Check the field "
+                      f"names listed beside each upload."})
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={
+            "detail": f"Could not parse the files: {exc}"})
+    except Exception:                                     # noqa: BLE001
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500, content={
+            "detail": "Reconciliation failed. The files parsed but the engine "
+                      "could not complete."})
+
+
+@functools.lru_cache(maxsize=1)
+def _model_configured() -> bool:
+    """
+    Whether a provider is configured. Keys come from the environment, which
+    does not change while the process runs, so this is resolved once rather
+    than on every probe: the page and uptime monitors call health constantly,
+    and building the provider chain is the slowest thing it did.
+    """
+    from llm import get_provider
+    return bool(get_provider().available)
+
+
+@app.get("/api/v1/health", tags=["meta"])
+def api_health() -> dict:
+    return {"status": "ok", "version": app.version, "model_required": False,
+            "model_configured": _model_configured()}
+
+
+@app.get("/api/v1/taxonomy", tags=["meta"])
+def api_taxonomy() -> dict:
+    """Every classification the engine can emit, with its severity."""
+    return taxonomy_payload()
+
+
+@app.get("/api/v1/datasets", tags=["reconcile"])
+def api_datasets() -> list[dict]:
+    """The bundled sample batches that can be reconciled by name."""
+    return [d for d in DATASET_INFO if (DATASETS / d["name"]).is_dir()]
+
+
+@app.post("/api/v1/datasets/{name}", tags=["reconcile"])
+def api_dataset(name: str, request: Request) -> JSONResponse:
+    # Resolved against the known list, never joined blindly: a name like
+    # "../src" must not reach the filesystem.
+    if name not in {d["name"] for d in api_datasets()}:
+        return JSONResponse(status_code=404,
+                            content={"detail": f"unknown dataset '{name}'"})
+    if (limited := _engine_limited(request)):
+        return limited
+    return _analyse_or_error(DATASETS / name, source=name)
+
+
+@app.post("/api/v1/sample", tags=["reconcile"])
+async def api_sample(request: Request) -> JSONResponse:
+    """
+    Generate a fresh batch and reconcile it. Body (all optional):
+    {"seed": 42, "orders": 120, "defect_scale": 1.0, "compound": false}
+    """
+    import subprocess
+
+    if (limited := _engine_limited(request)):
+        return limited
+    try:
+        body = await request.json()
+    except Exception:                                     # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        seed = int(body.get("seed", 42))
+        orders = int(body.get("orders", 120))
+        scale = float(body.get("defect_scale", 1.0))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={
+            "detail": "seed and orders must be integers, defect_scale a number"})
+    if not (0 <= seed <= 1_000_000 and 20 <= orders <= 2000
+            and 0.0 <= scale <= 6.0):
+        return JSONResponse(status_code=400, content={
+            "detail": "seed 0-1000000, orders 20-2000, defect_scale 0-6"})
+
+    tmp = Path(tempfile.mkdtemp(prefix="recon-sample-"))
+    try:
+        cmd = [sys.executable, str(SRC / "generate_data.py"), "--seed",
+               str(seed), "--orders", str(orders), "--defect-scale",
+               str(scale), "--out", str(tmp)]
+        if body.get("compound"):
+            cmd.append("--compound")
+        # Blocking work runs in the thread pool: the generator is a separate
+        # process and the engine is CPU-bound, and neither should hold the
+        # event loop while other visitors wait.
+        await run_in_threadpool(subprocess.run, cmd, check=True,
+                                capture_output=True, timeout=60)
+        label = f"Generated batch, seed {seed}, {orders} orders"
+        if scale != 1.0:
+            label += f", defects x{scale:g}"
+        if body.get("compound"):
+            label += ", compound"
+        return await run_in_threadpool(_analyse_or_error, tmp, label)
+    except Exception:                                     # noqa: BLE001
+        print(traceback.format_exc(limit=3), file=sys.stderr)
+        return JSONResponse(status_code=500,
+                            content={"detail": "sample generation failed"})
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@app.post("/api/v1/reconcile", tags=["reconcile"])
+async def api_reconcile(
+    request: Request,
+    ledger: UploadFile = File(...),
+    gateway: UploadFile = File(...),
+    bank: UploadFile = File(...),
+    settlements: UploadFile | None = File(None),
+    ground_truth: UploadFile | None = File(None),
+) -> JSONResponse:
+    """Reconcile uploaded CSVs. Nothing is stored after the response."""
+    if (limited := _engine_limited(request)):
+        return limited
+    tmp = Path(tempfile.mkdtemp(prefix="recon-"))
+    try:
+        uploads = {"ledger": ledger, "gateway": gateway, "bank": bank,
+                   "settlements": settlements, "ground_truth": ground_truth}
+        for name, f in uploads.items():
+            if f is None:
+                continue
+            data = await _read_bounded(f)
+            if data is None:
+                return JSONResponse(status_code=413, content={
+                    "detail": f"{name}.csv is larger than "
+                              f"{MAX_BYTES // 1024 // 1024} MB"})
+            if not data.strip():
+                if name in REQUIRED:
+                    return JSONResponse(status_code=400, content={
+                        "detail": f"{name}.csv is empty"})
+                continue
+            (tmp / f"{name}.csv").write_bytes(data)
+        _write_stubs(tmp)
+        return await run_in_threadpool(_analyse_or_error, tmp, "Your upload")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# The model-backed endpoints under the versioned prefix, so the dashboard has
+# one base path. Same handlers, same limits.
+app.add_api_route("/api/v1/investigate", investigate, methods=["POST"],
+                  tags=["model"])
+app.add_api_route("/api/v1/ask", ask, methods=["POST"], tags=["model"])
+
+
+# --------------------------------------------------------------------------
+# Dashboard assets. Registered last so no API route is ever shadowed.
+# --------------------------------------------------------------------------
+
+@app.get("/{path:path}", include_in_schema=False)
+def spa_files(path: str):
+    if path.startswith("api/"):
+        return JSONResponse(status_code=404, content={"detail": "not found"})
+    if WEB_DIST.is_dir():
+        target = (WEB_DIST / path).resolve()
+        # Refuse anything that resolves outside the build directory.
+        if target.is_file() and WEB_DIST.resolve() in target.parents:
+            headers = ({"Cache-Control": "public, max-age=31536000, immutable"}
+                       if path.startswith("assets/") else {})
+            return FileResponse(target, headers=headers)
+        if (idx := _spa_index()) and "." not in path.rsplit("/", 1)[-1]:
+            return FileResponse(idx)      # client-side route
+    return JSONResponse(status_code=404, content={"detail": "not found"})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
