@@ -1,3 +1,4 @@
+<<<<<<< HEAD
  LedgerLens AI — Intelligent Payment Reconciliation & Risk Detection
 
 > AI-assisted payment reconciliation platform for matching merchant orders, payment gateway transactions, and bank settlements while detecting mismatches, anomalies, and unresolved payment issues.
@@ -364,3 +365,281 @@ The current implementation uses structured datasets and a local reconciliation w
 Ugesh Yada
 
 B.Tech Computer Science Engineering — 2026
+=======
+LedgerLens AI — Intelligent Payment Reconciliation \&
+
+Risk Detection
+
+An adapted and extended payment reconciliation project for studying transaction matching, reconciliation workflows,
+
+exception detection, and AI-assisted investigation.
+
+Based on the original Three-Way Financial Reconciliation Engine by Rahul Paul.
+
+Overview
+
+LedgerLens AI reconciles payment records across multiple financial sources and identifies mismatches, unresolved
+
+transactions, and potential risk conditions.
+
+The project focuses on:
+
+• Payment reconciliation
+
+• Transaction matching
+
+• Exception detection
+
+• Investigation workflows
+
+• Risk-oriented analysis
+
+• AI-assisted investigation
+
+• Deterministic verification
+
+Key Capabilities
+
+Three-way reconciliation
+
+The system compares transaction information across:
+
+1\. Merchant ledger 2. Payment gateway report 3. Bank statement
+
+It attempts to match corresponding records and classifies differences for further investigation.
+
+Exception detection
+
+Transactions can be surfaced when records disagree across sources, including:
+
+• Missing transactions
+
+• Amount mismatches
+
+• Status mismatches
+
+• Duplicate records
+
+• Timing-related differences
+
+• Other reconciliation exceptions
+
+AI-assisted investigation
+
+AI can be used to assist with investigation and explanation of reconciliation exceptions.
+
+The core design principle is:
+
+Model proposes; deterministic code verifies.
+
+AI-generated suggestions should therefore be treated as investigative assistance rather than as the final source of truth.
+
+Architecture
+
+The project is organized around a Python reconciliation engine with a web interface.
+
+High-level flow:
+
+Merchant Ledger \\ \\ Reconciliation Engine / / Payment Gateway
+
+Bank Statement | v Exception Detection | v Investigation / Risk Analysis | v Report / Dashboard
+
+Technology Stack
+
+Backend
+
+• Python
+
+• FastAPI
+
+• Pydantic
+
+• Deterministic reconciliation logic
+
+Frontend
+
+• React
+
+• TypeScript
+
+• Vite
+
+• Tailwind CSS
+
+AI / Investigation
+
+• LLM-assisted investigation
+
+• Rule-based validation
+
+• Structured reconciliation results
+
+Testing
+
+• Pytest
+
+• API tests
+
+• Reconciliation tests
+
+Project Structure
+
+LedgerLens-AI/
+
+nnn src/
+
+n nnn agent.py
+
+n nnn analysis.py
+
+n nnn app.py
+
+n nnn core.py
+
+n nnn evaluate.py
+
+n nnn investigate.py
+
+n nnn llm.py
+
+n nnn matcher.py
+
+n nnn narration.py
+
+n nnn report.py
+
+n nnn tools.py
+
+n
+
+nnn web/
+
+n nnn src/
+
+n nnn public/
+
+n nnn package.json
+
+n nnn vite.config.ts
+
+n
+
+nnn datasets/
+
+nnn data/
+
+nnn tests/
+
+nnn scripts/
+
+nnn ARCHITECTURE.md
+
+nnn DECISIONS.md
+
+nnn LICENSE
+
+nnn README.md
+
+Running Locally
+
+Backend
+
+Create and activate a Python virtual environment, then install dependencies:
+
+pip install -r requirements.txt
+
+Run the application:
+
+uvicorn src.app:app --reload
+
+Frontend
+
+Navigate to the web directory:
+
+cd web
+
+npm install
+
+npm run dev
+
+The frontend can then be opened through the local Vite development server.
+
+Reconciliation Workflow
+
+A typical reconciliation flow is:
+
+1\. Load transaction data from the relevant sources. 2. Normalize transaction fields. 3. Match records using deterministic rules.
+
+4\. Identify unmatched or conflicting records. 5. Classify reconciliation exceptions. 6. Perform additional investigation where
+
+required. 7. Generate reconciliation results and reports. 8. Review risk-oriented findings.
+
+API
+
+The backend exposes API functionality for working with reconciliation data and investigation workflows.
+
+The exact endpoints and request/response formats are implemented in `src/app.py`.
+
+Dashboard
+
+The web application provides a visual interface for reviewing reconciliation results and investigating exceptions.
+
+The dashboard is intended to make financial discrepancies easier to inspect and understand.
+
+Testing
+
+Run the Python test suite with:
+
+pytest
+
+Tests cover important application and reconciliation behavior.
+
+Design Principles
+
+Deterministic verification
+
+Financial reconciliation should rely on deterministic rules for final verification wherever possible.
+
+Explainability
+
+Reconciliation results should be understandable and traceable back to the underlying transaction records.
+
+AI as an assistant
+
+AI can help summarize, investigate, and explain exceptions, but deterministic validation remains important for financial
+
+workflows.
+
+Exception-first workflow
+
+The system focuses attention on records that require investigation rather than treating every transaction as equally important.
+
+Limitations
+
+This project is intended for engineering study, experimentation, and demonstration.
+
+It should not be treated as a production financial reconciliation system without additional work around:
+
+• Security
+
+• Authentication and authorization
+
+• Data privacy
+
+• Audit controls
+
+• Production data validation
+
+• Financial compliance
+
+• Observability
+
+• Reliability
+
+• Operational monitoring
+
+• Large-scale performance
+
+
+
+>>>>>>> 719d72d (Rebrand project as LedgerLens AI)

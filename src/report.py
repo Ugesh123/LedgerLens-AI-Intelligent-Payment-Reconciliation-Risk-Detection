@@ -227,7 +227,7 @@ def build(datadir: Path, outfile: Path, traces_path: Path | None = None,
     parts: list[str] = [f"""<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><title>Reconciliation report</title>
 <style>{CSS}</style></head><body>
-<h1>Three-way reconciliation report</h1>
+<h1>LedgerLens AI — Reconciliation Report</h1>
 <div class="sub">merchant ledger &middot; gateway report &middot; bank statement
 &mdash; generated {datetime.now():%d %B %Y, %H:%M}</div>
 

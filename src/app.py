@@ -151,7 +151,7 @@ class BodySizeLimit:
 
 
 app = FastAPI(
-    title="Three-way reconciliation",
+   title="LedgerLens AI",
     version="2.0.0",
     description=("Reconciles a merchant ledger, a payment gateway report and a "
                  "bank statement. The deterministic endpoints need no API key."),
@@ -167,7 +167,7 @@ app.add_middleware(GZipMiddleware, minimum_size=2048)
 # listed may, and none of the endpoints use cookies, so credentials stay off.
 _ORIGINS = [o.strip() for o in os.environ.get(
     "RECON_CORS_ORIGINS",
-    "https://rahulpaul-07.github.io,http://localhost:5173,http://127.0.0.1:5173",
+    "https://ugesh123.github.io,http://localhost:5173,http://127.0.0.1:5173",
 ).split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=_ORIGINS,
                    allow_methods=["GET", "POST"],
@@ -290,7 +290,7 @@ def _provider_for(request_key: str | None):
 
 PAGE = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Three-way reconciliation</title><style>
+<title>LedgerLens AI — Payment Reconciliation & Risk Detection</title><style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0f0f0f;color:#e8e6e3;font:15px/1.6 ui-sans-serif,-apple-system,
      "Segoe UI",system-ui,sans-serif;padding:48px 24px;max-width:820px;margin:0 auto}
@@ -326,8 +326,8 @@ button.ghost{background:#232323;color:#d8d4cf;font-weight:500;margin-left:9px}
 code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;
      color:#b8b3ad}
 </style></head><body>
+<h1>LedgerLens AI — Intelligent Payment Reconciliation & Risk Detection</h1>
 
-<h1>Three-way payment reconciliation</h1>
 <div class="sub">Upload a merchant ledger, a payment gateway report and a bank
 statement. The engine matches them, reports what it resolved and how certain
 each resolution is, and lists every record it could not resolve with a

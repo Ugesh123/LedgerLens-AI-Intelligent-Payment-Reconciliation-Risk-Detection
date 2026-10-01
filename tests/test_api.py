@@ -140,10 +140,10 @@ class TestApi:
 
     def test_cors_allows_the_pages_site_only(self, client):
         ok = client.options("/api/v1/sample", headers={
-            "Origin": "https://rahulpaul-07.github.io",
+            "Origin": "https://ugesh123.github.io",
             "Access-Control-Request-Method": "POST"})
         assert ok.headers["access-control-allow-origin"] == \
-            "https://rahulpaul-07.github.io"
+            "https://ugesh123.github.io"
         bad = client.options("/api/v1/sample", headers={
             "Origin": "https://evil.example",
             "Access-Control-Request-Method": "POST"})
@@ -270,10 +270,10 @@ class TestLimits:
         r = client.post("/api/v1/reconcile", content=b"x",
                         headers={"content-length": str(limit + 1),
                                  "content-type": "multipart/form-data; b=x",
-                                 "origin": "https://rahulpaul-07.github.io"})
+                                 "origin": "https://ugesh123.github.io"})
         assert r.status_code == 413
         assert r.headers["access-control-allow-origin"] == \
-            "https://rahulpaul-07.github.io"
+            "https://ugesh123.github.io"
 
     def test_an_undeclared_body_is_counted_as_it_arrives(self):
         """A chunked body declares no length; the bytes are counted instead."""
