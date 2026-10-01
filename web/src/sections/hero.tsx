@@ -42,7 +42,7 @@ export function Hero({ reference, meta }: { reference: Run | null; meta: Meta | 
       <LedgerBackdrop />
       <div className="relative mx-auto grid max-w-page gap-12 px-5 pb-16 pt-12 sm:px-8 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:items-center lg:gap-14 lg:pb-24 lg:pt-20">
         <div className="max-w-xl">
-          <p className="smallcaps mb-5 text-sm text-graphite">Three-way payment reconciliation</p>
+          <p className="smallcaps mb-5 text-sm text-graphite">LedgerLens AI</p>
           <h1 className="text-display text-balance font-medium">
             Three systems record every sale. <em className="font-medium text-redink">They never agree.</em>
           </h1>
