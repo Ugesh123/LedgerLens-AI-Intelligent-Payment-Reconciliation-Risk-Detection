@@ -72,7 +72,7 @@ export function NavBar({ engine }: { engine: Engine }) {
             <rect x="2.5" y="2.5" width="27" height="27" fill="none" className="stroke-paper/40" strokeWidth="1" />
             <path d="M8 17l5 5 11-12" className="stroke-paper" strokeWidth="3" fill="none" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
-          <span className="hidden sm:inline">Three-way reconciliation</span>
+          <span className="hidden sm:inline">LedgerLens AI</span>
           <span className="sm:hidden">Recon</span>
         </a>
         <div className="ml-auto hidden items-center gap-1 text-sm lg:flex">
